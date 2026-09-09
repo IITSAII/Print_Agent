@@ -67,7 +67,13 @@ public class PrinterService {
 
         pageFormat.setPaper(paper);
 
-        pageFormat.setOrientation(PageFormat.LANDSCAPE);
+        // PAPER_WIDTH/PAPER_HEIGHT가 이미 6x4(가로가 긴 landscape 모양)로 정의돼 있는데,
+        // 여기서 다시 LANDSCAPE를 걸면 Java가 이미 landscape 모양인 용지를 한 번 더
+        // 90도 회전시켜 imageable 영역이 4x6(세로로 좁고 긴 모양)으로 뒤바뀐다. 그 결과
+        // 실제 432x288pt 물리 용지에 288x432pt짜리 인쇄 가능 영역이 계산되어, 내용이
+        // 좁게 눌려 찍히고 오른쪽에 여백이 남는다. Paper 크기 자체로 이미 방향을
+        // 표현했으므로 여기서는 추가 회전 없이 PORTRAIT(기본값)을 유지한다.
+        pageFormat.setOrientation(PageFormat.PORTRAIT);
 
         return pageFormat;
     }

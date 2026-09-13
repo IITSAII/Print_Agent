@@ -22,6 +22,7 @@ public class BackendClient {
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(url))
+                .header("X-Agent-Token", PrintAgentConfig.AGENT_TOKEN)
                 .GET()
                 .build();
 
@@ -43,6 +44,7 @@ public class BackendClient {
     public void completePrint(String sessionId) throws Exception {
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(PrintAgentConfig.BASE_URL + "/api/sessions/" + sessionId + "/print/done"))
+                .header("X-Agent-Token", PrintAgentConfig.AGENT_TOKEN)
                 .method("PATCH", HttpRequest.BodyPublishers.noBody())
                 .build();
 

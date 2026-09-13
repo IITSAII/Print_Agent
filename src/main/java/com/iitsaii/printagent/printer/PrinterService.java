@@ -2,35 +2,45 @@ package com.iitsaii.printagent.printer;
 
 import com.iitsaii.printagent.config.PrintAgentConfig;
 
+import javax.imageio.IIOImage;
 import javax.imageio.ImageIO;
-import javax.print.*;
+import javax.imageio.ImageTypeSpecifier;
+import javax.imageio.ImageWriteParam;
+import javax.imageio.ImageWriter;
+import javax.imageio.metadata.IIOMetadata;
+import javax.imageio.metadata.IIOMetadataNode;
+import javax.imageio.stream.ImageOutputStream;
 import java.awt.*;
 import java.awt.geom.AffineTransform;
+import java.awt.geom.Rectangle2D;
 import java.awt.image.BufferedImage;
-import java.awt.print.PageFormat;
-import java.awt.print.Paper;
-import java.awt.print.Printable;
-import java.awt.print.PrinterJob;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.nio.file.Path;
+import java.util.Iterator;
 
 public class PrinterService {
 
-    private static final double PAPER_WIDTH = 6.0 * 72.0;
-    private static final double PAPER_HEIGHT = 4.0 * 72.0;
+    // PPD(DNP-DS-RX1.ppd.gz)의 "*PaperDimension 300dnp6x4"가 442.56 x 297.6pt로 선언되어 있다
+    // (정확히 6x4인치가 아니라 6.1467 x 4.1333인치). 이전에 정확히 6x4인치(1800x1200px)로 캔버스를
+    // 만들었더니 실제 페이지 크기보다 작아서 CUPS가 재배치/스케일링하며 잘림/여백이 생겼다.
+    // 300dpi 기준으로 픽셀 환산: 442.56pt / 72 * 300 = 1844px, 297.6pt / 72 * 300 = 1240px.
+    private static final int CANVAS_WIDTH_PX = 1844;
+    private static final int CANVAS_HEIGHT_PX = 1240;
 
-    private static final double STRIP_WIDTH = 6.0 * 72.0;
-    private static final double STRIP_HEIGHT = 2.0 * 72.0;
+    private static final int DPI = 300;
 
-    public void print(Path imagePath) throws Exception{
+    /**
+     * javax.print.PrinterJob으로는 PPD의 커스텀 옵션(Cutter 등)을 지정할 방법이 없어
+     * (표준 javax.print 속성에 대응하는 게 없음) 드라이버 기본값에만 의존하게 되고, 그 결과
+     * 가로/세로가 뒤집히거나 커터가 동작하지 않는 문제가 있었다. 대신 완성된 이미지를 파일로
+     * 렌더링한 뒤 lp 명령을 직접 실행해 -o 옵션으로 PageSize/Cutter/Resolution을 명시적으로
+     * 지정한다 - 이 방식은 lp로 직접 인쇄했을 때 정상 동작했던 경로와 동일하다.
+     */
+    public void print(Path imagePath) throws Exception {
 
         System.out.println("[PRINT] 출력 시작");
         System.out.println("[PRINT] 원본 이미지 = " + imagePath);
-
-        PrintService printer = findPrinter();
-
-        if (printer == null) {
-            throw new RuntimeException("DNP 프린터를 찾을 수 없습니다.");
-        }
 
         BufferedImage source = ImageIO.read(imagePath.toFile());
 
@@ -40,69 +50,146 @@ public class PrinterService {
 
         System.out.println("[PRINT] 원본 이미지 크기 = " + source.getWidth() + "x" + source.getHeight());
 
-        PrinterJob printerJob = PrinterJob.getPrinterJob();
+        BufferedImage canvas = composeCanvas(source);
 
-        printerJob.setPrintService(printer);
+        // 디버깅을 위해 임시 파일 대신 고정 경로에 저장한다 (DPI/스케일 문제 조사가 끝나면
+        // 다시 Files.createTempFile + finally에서 삭제하는 방식으로 되돌린다).
+        Path tempFile = Path.of(System.getProperty("user.home"), "Downloads", "print-agent-debug.jpg");
 
-        PageFormat pageFormat = createPageFormat();
+        try {
+            System.out.println("[PRINT] 캔버스 크기 = " + canvas.getWidth() + "x" + canvas.getHeight());
 
-        printerJob.setPrintable(createPrintable(source), pageFormat);
+            // ImageIO.write(jpg)는 DPI 메타데이터를 72로 기본 저장한다. 이전에 이 값이 72로
+            // 저장되는 바람에 CUPS/드라이버가 이미지의 물리적 크기를 (1844px/72dpi=25.6인치처럼)
+            // 실제보다 훨씬 크게 해석해서, print-scaling=none을 줘도 위치/크기가 계속 어긋났다.
+            // JPEG에 300dpi를 명시적으로 박아 이 오해석을 없앤다.
+            writeJpegWithDpi(canvas, tempFile.toFile(), DPI);
 
-        System.out.println("[PRINT] PrinterJob 출력 시작");
+            System.out.println("[PRINT] lp 명령으로 전송 시작: " + tempFile);
 
-        printerJob.print();
+            ProcessBuilder processBuilder = new ProcessBuilder(
+                    "lp",
+                    "-d", PrintAgentConfig.CUPS_PRINTER_NAME,
+                    "-o", "PageSize=300dnp6x4",
+                    "-o", "Cutter=2Inch",
+                    "-o", "Resolution=300x300dpi",
+                    // 캔버스를 PPD의 실제 PaperDimension과 정확히 같은 픽셀 크기로 만들었으므로,
+                    // CUPS가 추가로 비율을 맞추거나(fit) 자르지(crop) 않고 있는 그대로 찍도록 한다.
+                    "-o", "print-scaling=none",
+                    tempFile.toString()
+            );
+            processBuilder.redirectErrorStream(true);
 
-        System.out.println("[PRINT] PrinterJob 출력 종료");
-    }
+            Process process = processBuilder.start();
 
-    private PageFormat createPageFormat() {
-
-        PageFormat pageFormat = new PageFormat();
-
-        Paper paper = new Paper();
-
-        paper.setSize(PAPER_WIDTH, PAPER_HEIGHT);
-
-        paper.setImageableArea(0, 0, PAPER_WIDTH, PAPER_HEIGHT);
-
-        pageFormat.setPaper(paper);
-
-        // PAPER_WIDTH/PAPER_HEIGHT가 이미 6x4(가로가 긴 landscape 모양)로 정의돼 있는데,
-        // 여기서 다시 LANDSCAPE를 걸면 Java가 이미 landscape 모양인 용지를 한 번 더
-        // 90도 회전시켜 imageable 영역이 4x6(세로로 좁고 긴 모양)으로 뒤바뀐다. 그 결과
-        // 실제 432x288pt 물리 용지에 288x432pt짜리 인쇄 가능 영역이 계산되어, 내용이
-        // 좁게 눌려 찍히고 오른쪽에 여백이 남는다. Paper 크기 자체로 이미 방향을
-        // 표현했으므로 여기서는 추가 회전 없이 PORTRAIT(기본값)을 유지한다.
-        pageFormat.setOrientation(PageFormat.PORTRAIT);
-
-        return pageFormat;
-    }
-
-    private Printable createPrintable(BufferedImage source) {
-
-        return(graphics, pageFormat, pageIndex) -> {
-
-            if (pageIndex > 0) {
-                return Printable.NO_SUCH_PAGE;
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    System.out.println("[LP] " + line);
+                }
             }
 
-            Graphics2D g2 = (Graphics2D) graphics;
+            int exitCode = process.waitFor();
 
-            g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+            if (exitCode != 0) {
+                throw new RuntimeException("lp 명령 실행 실패 (exitCode=" + exitCode + ")");
+            }
 
-            double imageableX = pageFormat.getImageableX();
-            double imageableY = pageFormat.getImageableY();
+            System.out.println("[PRINT] lp 명령 전송 완료");
+        } finally {
+            // 디버깅 중이라 tempFile을 지우지 않고 남겨둔다. ~/Downloads/print-agent-debug.jpg에서 확인 가능.
+        }
+    }
 
-            double imageableWidth = pageFormat.getImageableWidth();
-            double imageableHeight = pageFormat.getImageableHeight();
+    /**
+     * JPEG의 JFIF 헤더(app0JFIF 마커)에 dpi를 직접 명시해 저장한다.
+     * 표준 메타데이터(HorizontalPixelSize 등)로 시도했을 때는 그 노드가 "dpi"가 아니라
+     * "픽셀 1개의 물리적 크기(mm)"를 의미하는 걸 놓쳐 값을 반대로(역수) 넣는 바람에 반영되지
+     * 않았다. JFIF 마커에 직접 Xdensity/Ydensity/resUnits를 쓰는 게 더 확실하다.
+     */
+    private void writeJpegWithDpi(BufferedImage image, java.io.File output, int dpi) throws Exception {
 
-            double stripHeight = imageableHeight / 2.0;
+        Iterator<ImageWriter> writers = ImageIO.getImageWritersByFormatName("jpg");
 
-            drawRotatedStrip(g2, source, imageableX, imageableY, imageableWidth, stripHeight);
-            drawRotatedStrip(g2, source, imageableX, imageableY + stripHeight, imageableWidth, stripHeight);
+        if (!writers.hasNext()) {
+            throw new RuntimeException("JPEG ImageWriter를 찾을 수 없습니다.");
+        }
 
-            return Printable.PAGE_EXISTS;
-        };
+        ImageWriter writer = writers.next();
+        ImageWriteParam writeParam = writer.getDefaultWriteParam();
+        ImageTypeSpecifier typeSpecifier = ImageTypeSpecifier.createFromBufferedImageType(BufferedImage.TYPE_INT_RGB);
+
+        IIOMetadata metadata = writer.getDefaultImageMetadata(typeSpecifier, writeParam);
+
+        String nativeFormat = metadata.getNativeMetadataFormatName();
+        IIOMetadataNode root = (IIOMetadataNode) metadata.getAsTree(nativeFormat);
+
+        IIOMetadataNode jfif = findOrCreateApp0Jfif(root);
+        jfif.setAttribute("resUnits", "1"); // 1 = dots per inch
+        jfif.setAttribute("Xdensity", Integer.toString(dpi));
+        jfif.setAttribute("Ydensity", Integer.toString(dpi));
+
+        metadata.setFromTree(nativeFormat, root);
+
+        try (ImageOutputStream stream = ImageIO.createImageOutputStream(output)) {
+            writer.setOutput(stream);
+            writer.write(null, new IIOImage(image, null, metadata), writeParam);
+        } finally {
+            writer.dispose();
+        }
+    }
+
+    /** JPEG 네이티브 메타데이터 트리에서 JPEGvariety/app0JFIF 노드를 찾고, 없으면 새로 만든다. */
+    private IIOMetadataNode findOrCreateApp0Jfif(IIOMetadataNode root) {
+
+        IIOMetadataNode jpegVariety = findChild(root, "JPEGvariety");
+
+        if (jpegVariety == null) {
+            jpegVariety = new IIOMetadataNode("JPEGvariety");
+            root.insertBefore(jpegVariety, root.getFirstChild());
+        }
+
+        IIOMetadataNode jfif = findChild(jpegVariety, "app0JFIF");
+
+        if (jfif == null) {
+            jfif = new IIOMetadataNode("app0JFIF");
+            jfif.setAttribute("majorVersion", "1");
+            jfif.setAttribute("minorVersion", "2");
+            jfif.setAttribute("thumbWidth", "0");
+            jfif.setAttribute("thumbHeight", "0");
+            jpegVariety.appendChild(jfif);
+        }
+
+        return jfif;
+    }
+
+    private IIOMetadataNode findChild(IIOMetadataNode parent, String name) {
+
+        org.w3c.dom.NodeList children = parent.getElementsByTagName(name);
+
+        return children.getLength() > 0 ? (IIOMetadataNode) children.item(0) : null;
+    }
+
+    /** 6x4 캔버스(300dpi)에 원본 이미지를 90도 회전시켜 2등분(2Inch 컷 라인 기준)해 그린다. */
+    private BufferedImage composeCanvas(BufferedImage source) {
+
+        BufferedImage canvas = new BufferedImage(CANVAS_WIDTH_PX, CANVAS_HEIGHT_PX, BufferedImage.TYPE_INT_RGB);
+
+        Graphics2D g2 = canvas.createGraphics();
+
+        g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+
+        g2.setColor(Color.WHITE);
+        g2.fillRect(0, 0, CANVAS_WIDTH_PX, CANVAS_HEIGHT_PX);
+
+        int stripHeight = CANVAS_HEIGHT_PX / 2;
+
+        drawRotatedStrip(g2, source, 0, 0, CANVAS_WIDTH_PX, stripHeight);
+        drawRotatedStrip(g2, source, 0, stripHeight, CANVAS_WIDTH_PX, stripHeight);
+
+        g2.dispose();
+
+        return canvas;
     }
 
     private void drawRotatedStrip(Graphics2D g2, BufferedImage source, double x, double y, double targetWidth, double targetHeight) {
@@ -113,7 +200,11 @@ public class PrinterService {
         double scaleX = targetWidth / rotatedWidth;
         double scaleY = targetHeight / rotatedHeight;
 
-        double scale = Math.min(scaleX, scaleY);
+        // 비율을 유지한 채 "맞추기"(min)를 쓰면 원본과 스트립의 비율이 완전히 같지 않은 이상
+        // 남는 공간이 흰 여백으로 남는다 (두 스트립이 만나는 정중앙에 몰려 눈에 띄게 보였다).
+        // 대신 "꽉 채우기"(max)로 바꾸고 넘치는 부분은 클리핑으로 잘라낸다 - 이미지 가장자리가
+        // 아주 살짝(1% 미만) 잘리지만 흰 여백 없이 스트립을 완전히 채울 수 있다.
+        double scale = Math.max(scaleX, scaleY);
 
         double drawWidth = rotatedWidth * scale;
         double drawHeight = rotatedHeight * scale;
@@ -130,23 +221,13 @@ public class PrinterService {
 
         transform.scale(scale, scale);
 
+        // 꽉 채우기(fill)로 그리면 이미지가 target 영역보다 커져 넘칠 수 있으므로,
+        // 다른 스트립 영역을 침범하지 않도록 target 영역으로 클리핑한다.
+        Shape originalClip = g2.getClip();
+        g2.clip(new Rectangle2D.Double(x, y, targetWidth, targetHeight));
+
         g2.drawImage(source, transform, null);
-    }
 
-    private PrintService findPrinter() {
-
-        PrintService[] printers = PrintServiceLookup.lookupPrintServices(null, null);
-
-        System.out.println("[PRINT] Java에서 검색된 프린터 수 = " + printers.length);
-
-        for (PrintService printer : printers) {
-            System.out.println("[PRINT] Java 프린터 이름 = [" + printer.getName() + "]");
-
-            if (printer.getName().equals(PrintAgentConfig.PRINTER_NAME)) {
-                return printer;
-            }
-        }
-
-        return null;
+        g2.setClip(originalClip);
     }
 }

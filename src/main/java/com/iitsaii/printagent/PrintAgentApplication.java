@@ -27,7 +27,7 @@ public class PrintAgentApplication {
                     Path imagePath = imageDownloader.saveImage(job.finalImageUrl(), job.sessionId());
                     System.out.println("다운로드 완료 : " +imagePath);
 
-                    printerService.print(imagePath);
+                    printerService.print(imagePath, job.quantity());
                     System.out.println("인쇄 완료 처리");
 
                     backendClient.completePrint(job.sessionId());

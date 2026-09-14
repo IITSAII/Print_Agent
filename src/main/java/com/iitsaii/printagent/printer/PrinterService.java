@@ -1,146 +1,261 @@
 package com.iitsaii.printagent.printer;
 
-import com.iitsaii.printagent.config.PrintAgentConfig;
-
+import javax.imageio.IIOImage;
 import javax.imageio.ImageIO;
-import javax.print.*;
+import javax.imageio.ImageTypeSpecifier;
+import javax.imageio.ImageWriteParam;
+import javax.imageio.ImageWriter;
+import javax.imageio.metadata.IIOMetadata;
+import javax.imageio.metadata.IIOMetadataNode;
+import javax.imageio.stream.FileImageOutputStream;
 import java.awt.*;
-import java.awt.geom.AffineTransform;
 import java.awt.image.BufferedImage;
-import java.awt.print.PageFormat;
-import java.awt.print.Paper;
-import java.awt.print.Printable;
-import java.awt.print.PrinterJob;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.InputStreamReader;
 import java.nio.file.Path;
+import java.util.Iterator;
 
 public class PrinterService {
 
-    private static final double PAPER_WIDTH = 6.0 * 72.0;
-    private static final double PAPER_HEIGHT = 4.0 * 72.0;
+    private static final int CANVAS_WIDTH_PX = 1800;
+    private static final int CANVAS_HEIGHT_PX = 1200;
+    private static final int DPI = 300;
 
-    private static final double STRIP_WIDTH = 6.0 * 72.0;
-    private static final double STRIP_HEIGHT = 2.0 * 72.0;
-
-    public void print(Path imagePath) throws Exception{
+    public void print(Path imagePath, Integer quantity) throws Exception {
 
         System.out.println("[PRINT] 출력 시작");
-        System.out.println("[PRINT] 원본 이미지 = " + imagePath);
+        System.out.println("[PRINT] image path = " + imagePath);
 
-        PrintService printer = findPrinter();
+        BufferedImage sourceImage = ImageIO.read(imagePath.toFile());
 
-        if (printer == null) {
-            throw new RuntimeException("DNP 프린터를 찾을 수 없습니다.");
+        if (sourceImage == null) {
+            throw new RuntimeException("이미지 로드 실패: " + imagePath);
         }
 
-        BufferedImage source = ImageIO.read(imagePath.toFile());
+        System.out.println(
+                "[PRINT] source size = "
+                        + sourceImage.getWidth()
+                        + "x"
+                        + sourceImage.getHeight()
+        );
 
-        if (source == null) {
-            throw new RuntimeException("이미지를 읽을 수 없습니다." + imagePath);
-        }
+        BufferedImage canvas = composeCanvas(sourceImage);
 
-        System.out.println("[PRINT] 원본 이미지 크기 = " + source.getWidth() + "x" + source.getHeight());
+        File outputFile = Path.of(
+                System.getProperty("user.home"),
+                "Downloads",
+                "print-agent-debug.jpg"
+        ).toFile();
 
-        PrinterJob printerJob = PrinterJob.getPrinterJob();
+        System.out.println(
+                "[PRINT] composed canvas = "
+                        + canvas.getWidth()
+                        + "x"
+                        + canvas.getHeight()
+        );
 
-        printerJob.setPrintService(printer);
+        writeJpegWithDpi(canvas, outputFile, DPI);
 
-        PageFormat pageFormat = createPageFormat();
+        System.out.println("[PRINT] JPEG 저장 완료 : " + outputFile.getAbsolutePath());
 
-        printerJob.setPrintable(createPrintable(source), pageFormat);
-
-        System.out.println("[PRINT] PrinterJob 출력 시작");
-
-        printerJob.print();
-
-        System.out.println("[PRINT] PrinterJob 출력 종료");
-    }
-
-    private PageFormat createPageFormat() {
-
-        PageFormat pageFormat = new PageFormat();
-
-        Paper paper = new Paper();
-
-        paper.setSize(PAPER_WIDTH, PAPER_HEIGHT);
-
-        paper.setImageableArea(0, 0, PAPER_WIDTH, PAPER_HEIGHT);
-
-        pageFormat.setPaper(paper);
-
-        pageFormat.setOrientation(PageFormat.LANDSCAPE);
-
-        return pageFormat;
-    }
-
-    private Printable createPrintable(BufferedImage source) {
-
-        return(graphics, pageFormat, pageIndex) -> {
-
-            if (pageIndex > 0) {
-                return Printable.NO_SUCH_PAGE;
-            }
-
-            Graphics2D g2 = (Graphics2D) graphics;
-
-            g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
-
-            double imageableX = pageFormat.getImageableX();
-            double imageableY = pageFormat.getImageableY();
-
-            double imageableWidth = pageFormat.getImageableWidth();
-            double imageableHeight = pageFormat.getImageableHeight();
-
-            double stripHeight = imageableHeight / 2.0;
-
-            drawRotatedStrip(g2, source, imageableX, imageableY, imageableWidth, stripHeight);
-            drawRotatedStrip(g2, source, imageableX, imageableY + stripHeight, imageableWidth, stripHeight);
-
-            return Printable.PAGE_EXISTS;
+        Integer paperCount = switch (quantity) {
+            case 2 -> 1;
+            case 4 -> 2;
+            case 6 -> 3;
+            default -> throw new IllegalArgumentException(
+                    "지원하지 않는 출력 수량: " + quantity
+            );
         };
+
+        for (int i = 1; i <= paperCount; i++) {
+            ProcessBuilder pb = new ProcessBuilder(
+                    "lp",
+                    "-d", "Dai_Nippon_Printing_DS_RX1",
+                    "-o", "PageSize=300dnp6x4",
+                    "-o", "Cutter=2Inch",
+                    "-o", "Resolution=300x300dpi",
+                    "-o", "print-scaling=none",
+                    outputFile.getAbsolutePath()
+            );
+
+            pb.redirectErrorStream(true);
+
+            Process process = pb.start();
+
+            try (BufferedReader reader =
+                         new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    System.out.println("[lp] " + line);
+                }
+            }
+
+            int exitCode = process.waitFor();
+
+            if (exitCode != 0) {
+                throw new RuntimeException(
+                        "lp 명령 실패. exitCode=" + exitCode
+                );
+            }
+
+            System.out.println("[PRINT] lp 명령 전송 완료");
+        }
     }
 
-    private void drawRotatedStrip(Graphics2D g2, BufferedImage source, double x, double y, double targetWidth, double targetHeight) {
+    private BufferedImage composeCanvas(BufferedImage sourceImage) {
 
-        double rotatedWidth = source.getHeight();
-        double rotatedHeight = source.getWidth();
+        BufferedImage canvas = new BufferedImage(
+                CANVAS_WIDTH_PX,
+                CANVAS_HEIGHT_PX,
+                BufferedImage.TYPE_INT_RGB
+        );
 
-        double scaleX = targetWidth / rotatedWidth;
-        double scaleY = targetHeight / rotatedHeight;
+        Graphics2D g = canvas.createGraphics();
 
-        double scale = Math.min(scaleX, scaleY);
+        try {
+            g.setColor(Color.WHITE);
+            g.fillRect(0, 0, CANVAS_WIDTH_PX, CANVAS_HEIGHT_PX);
 
-        double drawWidth = rotatedWidth * scale;
-        double drawHeight = rotatedHeight * scale;
+            g.setRenderingHint(
+                    RenderingHints.KEY_INTERPOLATION,
+                    RenderingHints.VALUE_INTERPOLATION_BICUBIC
+            );
 
-        double drawX = x + (targetWidth - drawWidth) / 2.0;
+            drawRotatedStrip(g, sourceImage, 0, 0, 1800, 600);
+            drawRotatedStrip(g, sourceImage, 0, 600, 1800, 600);
 
-        double drawY = y + (targetHeight - drawHeight) / 2.0;
+        } finally {
+            g.dispose();
+        }
 
-        AffineTransform transform = new AffineTransform();
-
-        transform.translate(drawX + drawWidth, drawY);
-
-        transform.rotate(Math.PI / 2.0);
-
-        transform.scale(scale, scale);
-
-        g2.drawImage(source, transform, null);
+        return canvas;
     }
 
-    private PrintService findPrinter() {
+    private void drawRotatedStrip(
+            Graphics2D g,
+            BufferedImage source,
+            int x,
+            int y,
+            int targetWidth,
+            int targetHeight
+    ) {
 
-        PrintService[] printers = PrintServiceLookup.lookupPrintServices(null, null);
+        int rotatedWidth = source.getHeight();
+        int rotatedHeight = source.getWidth();
 
-        System.out.println("[PRINT] Java에서 검색된 프린터 수 = " + printers.length);
+        double scale = Math.min(
+                (double) targetWidth / rotatedWidth,
+                (double) targetHeight / rotatedHeight
+        );
 
-        for (PrintService printer : printers) {
-            System.out.println("[PRINT] Java 프린터 이름 = [" + printer.getName() + "]");
+        int drawWidth = (int) Math.round(rotatedWidth * scale);
+        int drawHeight = (int) Math.round(rotatedHeight * scale);
 
-            if (printer.getName().equals(PrintAgentConfig.PRINTER_NAME)) {
-                return printer;
+        int drawX = x + (targetWidth - drawWidth) / 2;
+        int drawY = y + (targetHeight - drawHeight) / 2;
+
+        Graphics2D g2 = (Graphics2D) g.create();
+
+        try {
+            g2.translate(
+                    drawX + drawWidth / 2.0,
+                    drawY + drawHeight / 2.0
+            );
+
+            g2.rotate(Math.toRadians(90));
+
+            g2.drawImage(
+                    source,
+                    -drawHeight / 2,
+                    -drawWidth / 2,
+                    drawHeight,
+                    drawWidth,
+                    null
+            );
+
+        } finally {
+            g2.dispose();
+        }
+    }
+
+    /**
+     * JPEG에 JFIF DPI(300x300)를 직접 기록.
+     */
+    private void writeJpegWithDpi(
+            BufferedImage image,
+            File file,
+            int dpi
+    ) throws Exception {
+
+        Iterator<ImageWriter> writers =
+                ImageIO.getImageWritersByFormatName("jpg");
+
+        if (!writers.hasNext()) {
+            throw new RuntimeException("JPEG ImageWriter를 찾을 수 없습니다.");
+        }
+
+        ImageWriter writer = writers.next();
+        ImageWriteParam param = writer.getDefaultWriteParam();
+
+        ImageTypeSpecifier type =
+                ImageTypeSpecifier.createFromBufferedImageType(
+                        BufferedImage.TYPE_INT_RGB
+                );
+
+        IIOMetadata metadata =
+                writer.getDefaultImageMetadata(type, param);
+
+        String formatName = metadata.getNativeMetadataFormatName();
+
+        IIOMetadataNode root =
+                (IIOMetadataNode) metadata.getAsTree(formatName);
+
+        IIOMetadataNode jfif = findOrCreateApp0Jfif(root);
+
+        jfif.setAttribute("resUnits", "1");
+        jfif.setAttribute("Xdensity", String.valueOf(dpi));
+        jfif.setAttribute("Ydensity", String.valueOf(dpi));
+
+        metadata.setFromTree(formatName, root);
+
+        try (FileImageOutputStream output =
+                     new FileImageOutputStream(file)) {
+
+            writer.setOutput(output);
+
+            writer.write(
+                    metadata,
+                    new IIOImage(image, null, metadata),
+                    param
+            );
+        }
+
+        writer.dispose();
+    }
+
+    private IIOMetadataNode findOrCreateApp0Jfif(
+            IIOMetadataNode root
+    ) {
+
+        for (int i = 0; i < root.getLength(); i++) {
+            if (root.item(i) instanceof IIOMetadataNode node) {
+                if ("app0JFIF".equals(node.getNodeName())) {
+                    return node;
+                }
             }
         }
 
-        return null;
+        IIOMetadataNode node = new IIOMetadataNode("app0JFIF");
+
+        node.setAttribute("majorVersion", "1");
+        node.setAttribute("minorVersion", "2");
+        node.setAttribute("thumbWidth", "0");
+        node.setAttribute("thumbHeight", "0");
+
+        root.appendChild(node);
+
+        return node;
     }
 }

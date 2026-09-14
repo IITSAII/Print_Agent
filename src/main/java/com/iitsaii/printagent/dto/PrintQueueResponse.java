@@ -5,5 +5,6 @@ public record PrintQueueResponse(
         String finalImageUrl,
         String frameType,
         Boolean filterBw,
-        Integer filterBrightness
+        Integer filterBrightness,
+        Integer quantity
 ) {}
